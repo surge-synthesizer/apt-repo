@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""End to end: fake debs + throwaway key -> create-pkg-info -> verify in docker."""
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+from make_test_deb import make_deb  # noqa: E402
+
+CHANNEL = "test-local"
+
+
+def run(*cmd, expect_fail=False):
+    print("$", " ".join(str(c) for c in cmd), flush=True)
+    r = subprocess.run([str(c) for c in cmd], capture_output=expect_fail, text=True)
+    if expect_fail:
+        if r.returncode == 0:
+            sys.exit(f"expected failure from {cmd}")
+        print("  failed as expected:", r.stderr.strip().splitlines()[-1])
+    elif r.returncode != 0:
+        sys.exit(f"command failed: {cmd}")
+
+
+def config(debs_by_pkg):
+    return {
+        "channel": CHANNEL,
+        "github_repo": "example/apt-repo",
+        "label": "apt-infra test",
+        "description": "local test channel",
+        "architectures": ["arm64", "amd64"],
+        "public_key_asset": "test-archive-key.asc",
+        "packages": [
+            {"name": n, "versions": [{"version": v, "debs": [str(d) for d in ds]} for v, ds in vers]}
+            for n, vers in debs_by_pkg
+        ],
+    }
+
+
+def main():
+    verify_args = sys.argv[1:]
+    with tempfile.TemporaryDirectory() as t:
+        t = Path(t)
+        keys = t / "keys"
+        keys.mkdir()
+        run(ROOT / "scripts/create-keys", "--out", keys, "--uid", "apt-infra test key", "--expire", "1d")
+
+        d = t / "debs"
+        d.mkdir()
+        tool = [
+            ("1.0.0", [make_deb(d, "aitest-tool", "1.0.0", "arm64", "xz"),
+                       make_deb(d, "aitest-tool", "1.0.0", "amd64", "gz")]),
+            ("1.1.0+git5~beta", [make_deb(d, "aitest-tool", "1.1.0+git5~beta", "arm64", "zst"),
+                                 make_deb(d, "aitest-tool", "1.1.0+git5~beta", "amd64", "zst")]),
+        ]
+        data = [("2.0", [make_deb(d, "aitest-data", "2.0", "all", "xz")])]
+
+        cfg_path = t / "test.json"
+        cfg_path.write_text(json.dumps(config([("aitest-tool", tool), ("aitest-data", data)]), indent=2))
+        key_args = ["--key", keys / "private_key.asc", "--public-key", keys / "public_key.asc"]
+
+        bad = t / "bad.json"
+        wrong = make_deb(d, "aitest-tool", "9.9", "arm64", control_version="9.8")
+        bad.write_text(json.dumps(config([("aitest-tool", [("9.9", [wrong])])])))
+        run(ROOT / "scripts/create-pkg-info", bad, *key_args, expect_fail=True)
+
+        run(ROOT / "scripts/create-pkg-info", cfg_path, *key_args)
+        run(ROOT / "scripts/verify", cfg_path, "--public-key", keys / "public_key.asc", *verify_args)
+
+        # a different key must be rejected by apt
+        other = t / "other"
+        other.mkdir()
+        run(ROOT / "scripts/create-keys", "--out", other, "--uid", "wrong key", "--expire", "1d")
+        run(ROOT / "scripts/verify", cfg_path, "--public-key", other / "public_key.asc",
+            "--arch", "arm64", "--no-install", expect_fail=True)
+    print("local test ok")
+
+
+if __name__ == "__main__":
+    main()

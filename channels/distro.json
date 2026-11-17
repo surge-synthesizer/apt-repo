@@ -1,0 +1,80 @@
+{
+  "channel": "distro",
+  "github_repo": "surge-synthesizer/apt-repo",
+  "origin": "surge-synthesizer",
+  "label": "surge-synthesizer apt-repo",
+  "description": "surge synth team plugins for debian",
+  "architectures": [
+    "arm64",
+    "amd64"
+  ],
+  "public_key_asset": "surge-synthesizer-apt-repo.asc",
+  "nightlies": [
+    {
+      "repo": "surge-synthesizer/surge",
+      "tag": "Nightly"
+    },
+    {
+      "repo": "surge-synthesizer/shortcircuit-xt",
+      "tag": "Nightly"
+    },
+    {
+      "repo": "surge-synthesizer/OB-Xf",
+      "tag": "Nightly"
+    },
+    {
+      "repo": "surge-synthesizer/SpectrumWorx",
+      "tag": "Nightly"
+    }
+  ],
+  "packages": [
+    {
+      "name": "surge-xt",
+      "versions": [
+        {
+          "version": "1.4.0~nightly.20261117.5695.78f07b152",
+          "debs": [
+            "content/surge-xt_1.4.0.nightly.20261117.5695.78f07b152_arm64.deb",
+            "content/surge-xt_1.4.0.nightly.20261117.5695.78f07b152_amd64.deb"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shortcircuit-xt",
+      "versions": [
+        {
+          "version": "0.9.322~nightly.20261117.1869.38b7d472",
+          "debs": [
+            "content/shortcircuit-xt_0.9.322.nightly.20261117.1869.38b7d472_amd64.deb",
+            "content/shortcircuit-xt_0.9.322.nightly.20261117.1869.38b7d472_arm64.deb"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "spectrumworx",
+      "versions": [
+        {
+          "version": "3.0.0~nightly.20261117.512.f3966af9",
+          "debs": [
+            "content/spectrumworx_3.0.0.nightly.20261117.512.f3966af9_amd64.deb",
+            "content/spectrumworx_3.0.0.nightly.20261117.512.f3966af9_arm64.deb"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ob-xf",
+      "versions": [
+        {
+          "version": "1.1.0~nightly.20261117.709.e03452f",
+          "debs": [
+            "content/ob-xf_1.1.0.nightly.20261117.709.e03452f_amd64.deb",
+            "content/ob-xf_1.1.0.nightly.20261117.709.e03452f_arm64.deb"
+          ]
+        }
+      ]
+    }
+  ]
+}

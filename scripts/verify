@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Check a channel with real apt: debian trixie in docker adds the repo, updates,
+downloads every listed version and installs the newest of each package."""
+
+import argparse
+import functools
+import http.server
+import subprocess
+import sys
+import threading
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aptlib  # noqa: E402
+
+PLATFORMS = {"amd64": "linux/amd64", "arm64": "linux/arm64", "armhf": "linux/arm/v7"}
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+
+def serve(directory, bind):
+    handler = functools.partial(QuietHandler, directory=str(directory))
+    srv = http.server.ThreadingHTTPServer((bind, 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def packages_by_arch(packages_text):
+    out = {}
+    for stanza in packages_text.strip().split("\n\n"):
+        f = aptlib.parse_control(stanza)
+        # apt lowercases package names
+        out.setdefault(f["Architecture"], []).append((f["Package"].lower(), f["Version"]))
+    return out
+
+
+def extra_source_lines(extra, arch):
+    # sources the channel's packages depend on, present on real machines but not in a bare image
+    lines = []
+    for s in extra:
+        if s.get("architectures") and arch not in s["architectures"]:
+            continue
+        key = Path(s["key"])
+        if not key.is_absolute():
+            key = aptlib.ROOT / key
+        if not key.is_file():
+            raise aptlib.AptError(
+                f"verify_sources {s['name']}: missing key {key}"
+                + (f" (copy it from {s['key_from']})" if s.get("key_from") else "")
+            )
+        body = ["Types: deb", f"URIs: {s['uris']}", f"Suites: {s['suites']}"]
+        if s.get("components"):
+            body.append(f"Components: {s['components']}")
+        body.append(f"Signed-By: /etc/apt/keyrings/verify-{s['name']}.asc")
+        lines += [
+            f"cat > /etc/apt/keyrings/verify-{s['name']}.asc <<'EOF'\n{key.read_text().strip()}\nEOF",
+            f"cat > /etc/apt/sources.list.d/verify-{s['name']}.sources <<'EOF'\n" + "\n".join(body) + "\nEOF",
+        ]
+    return lines
+
+
+def container_script(url, key_name, pkgs, install, extra):
+    sources = "\n".join(
+        ["Types: deb", f"URIs: {url}", "Suites: ./", f"Signed-By: /etc/apt/keyrings/{key_name}"]
+    )
+    lines = [
+        "set -ex",
+        "export DEBIAN_FRONTEND=noninteractive",
+    ]
+    # apt needs ca-certificates before it can read any https source
+    if url.startswith("https") or any("URIs: https" in l for l in extra):
+        lines += ["apt-get update -qq", "apt-get install -y -qq ca-certificates >/dev/null"]
+    lines += [
+        "mkdir -p /etc/apt/keyrings",
+        f"cp /verify/key.asc /etc/apt/keyrings/{key_name}",
+        f"cat > /etc/apt/sources.list.d/apt-infra.sources <<'EOF'\n{sources}\nEOF",
+        *extra,
+        "apt-get update --error-on=any",
+        "cd /tmp",
+    ]
+    for name, version in pkgs:
+        lines.append(f"apt-get download '{name}={version}'")
+    names = sorted({n for n, _ in pkgs})
+    lines.append("apt-cache policy " + " ".join(names))
+    if install:
+        lines.append("apt-get install -y --no-install-recommends " + " ".join(names))
+        lines.append("dpkg -l " + " ".join(names))
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("config")
+    ap.add_argument("--remote", action="store_true", help="test the published GitHub release, not build/")
+    ap.add_argument("--arch", action="append", help="limit to these architectures")
+    ap.add_argument("--no-install", action="store_true", help="download only, skip install")
+    ap.add_argument("--public-key", default=str(aptlib.ROOT / "public_key.asc"))
+    ap.add_argument("--bind", default="127.0.0.1", help="local http server address (0.0.0.0 on linux)")
+    ap.add_argument("--image", default="debian:trixie")
+    args = ap.parse_args()
+
+    cfg = aptlib.load_config(args.config)
+    srv = None
+    if args.remote:
+        url = aptlib.repo_url(cfg)
+        with urllib.request.urlopen(url + "Packages") as r:
+            packages = r.read().decode()
+    else:
+        d = aptlib.build_dir(cfg)
+        if not (d / "InRelease").exists():
+            raise aptlib.AptError(f"{d} not built; run create-pkg-info first")
+        srv = serve(d, args.bind)
+        url = f"http://host.docker.internal:{srv.server_address[1]}/"
+        packages = (d / "Packages").read_text()
+
+    by_arch = packages_by_arch(packages)
+    arches = args.arch or cfg["architectures"]
+    failed = []
+    for arch in arches:
+        pkgs = by_arch.get(arch, []) + by_arch.get("all", [])
+        if not pkgs:
+            print(f"== {arch}: nothing to check")
+            continue
+        print(f"== {arch}: {url}", flush=True)
+        extra = extra_source_lines(cfg.get("verify_sources", []), arch)
+        script = container_script(url, cfg["public_key_asset"], pkgs, not args.no_install, extra)
+        cmd = [
+            "docker", "run", "--rm", "-i",
+            "--platform", PLATFORMS[arch],
+            "--add-host=host.docker.internal:host-gateway",
+            "-v", f"{Path(args.public_key).resolve()}:/verify/key.asc:ro",
+            args.image, "bash", "-s",
+        ]
+        r = subprocess.run(cmd, input=script.encode())
+        if r.returncode != 0:
+            failed.append(arch)
+
+    if srv:
+        srv.shutdown()
+    if failed:
+        raise aptlib.AptError(f"verify failed for {', '.join(failed)}")
+    print(f"verify ok: {', '.join(arches)}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except aptlib.AptError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

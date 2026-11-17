@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Stage a channel's debs and signed apt index into build/<channel>/."""
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aptlib  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("config", help="channel config, e.g. channels/distro.json")
+    ap.add_argument("--key", help="private key file (default private_key.asc, or $APT_SIGNING_KEY)")
+    ap.add_argument("--public-key", default=str(aptlib.ROOT / "public_key.asc"))
+    args = ap.parse_args()
+
+    cfg = aptlib.load_config(args.config)
+    out = aptlib.build_dir(cfg)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+
+    stanzas = []
+    seen = {}
+    for p in cfg["packages"]:
+        for v in p["versions"]:
+            for src in v["debs"]:
+                deb = aptlib.fetch_deb(src, aptlib.repo_url(cfg))
+                control = aptlib.read_control(deb)
+                f = aptlib.parse_control(control)
+
+                arch = f.get("Architecture")
+                problems = []
+                if f.get("Package") != p["name"]:
+                    problems.append(f"Package is '{f.get('Package')}', config says '{p['name']}'")
+                if f.get("Version") != v["version"]:
+                    problems.append(f"Version is '{f.get('Version')}', config says '{v['version']}'")
+                if arch != "all" and arch not in cfg["architectures"]:
+                    problems.append(f"Architecture '{arch}' not in {cfg['architectures']}")
+                if problems:
+                    raise aptlib.AptError(f"{src}:\n  " + "\n  ".join(problems))
+
+                name = aptlib.asset_name(p["name"], v["version"], arch)
+                if name in seen:
+                    raise aptlib.AptError(f"{src} and {seen[name]} both map to {name}")
+                seen[name] = src
+
+                dest = out / name
+                shutil.copyfile(deb, dest)
+                h = aptlib.hashes(dest)
+                stanzas.append(aptlib.stanza_for(control, name, dest.stat().st_size, h))
+                print(f"  {name}")
+
+    aptlib.write_packages(out, stanzas)
+    aptlib.write_release(out, cfg)
+    aptlib.sign_release(out, args.key)
+
+    pub = Path(args.public_key)
+    if not pub.is_file():
+        raise aptlib.AptError(f"missing public key {pub}")
+    shutil.copyfile(pub, out / cfg["public_key_asset"])
+
+    print(f"{len(stanzas)} debs, signed index in {out}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except aptlib.AptError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

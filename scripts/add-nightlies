@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Add the current debs from each repo's nightly release (the config's 'nightlies')
+to a channel config, by handing their URLs to add-debs."""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import aptlib  # noqa: E402
+
+
+def nightly_debs(repo, tag):
+    r = subprocess.run(["gh", "release", "view", tag, "--repo", repo, "--json", "assets"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise aptlib.AptError(f"gh release view {tag} --repo {repo} failed:\n{r.stderr.strip()}")
+    return [a["url"] for a in json.loads(r.stdout)["assets"] if a["name"].endswith(".deb")]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("config", help="channel config, e.g. channels/distro.json")
+    ap.add_argument("--keep", type=int, default=3, help="newest N versions of each package to keep")
+    ap.add_argument("--dry-run", action="store_true", help="print the changes, write nothing")
+    args = ap.parse_args()
+
+    cfg = aptlib.load_config(args.config)
+    if not cfg.get("nightlies"):
+        raise aptlib.AptError(f"{args.config}: no 'nightlies' listed")
+
+    urls = []
+    for n in cfg["nightlies"]:
+        found = nightly_debs(n["repo"], n.get("tag", "Nightly"))
+        if not found:
+            raise aptlib.AptError(f"{n['repo']} {n.get('tag', 'Nightly')}: no debs")
+        print(f"{n['repo']}: {', '.join(Path(u).name for u in found)}", flush=True)
+        urls += found
+
+    cmd = [str(HERE / "add-debs"), args.config, *urls, "--keep", str(args.keep)]
+    if args.dry_run:
+        cmd.append("--dry-run")
+    sys.exit(subprocess.run(cmd).returncode)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except aptlib.AptError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

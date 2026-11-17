@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Create an ed25519 signing key pair: public_key.asc and private_key.asc."""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aptlib  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--uid", default="apt-infra archive signing key", help="key user id")
+    ap.add_argument("--expire", default="2y", help="gpg expiry, e.g. 2y")
+    ap.add_argument("--out", default=str(aptlib.ROOT), help="directory to write the keys to")
+    ap.add_argument("--force", action="store_true", help="overwrite existing keys")
+    args = ap.parse_args()
+
+    out = Path(args.out)
+    pub, priv = out / "public_key.asc", out / "private_key.asc"
+    if (pub.exists() or priv.exists()) and not args.force:
+        raise aptlib.AptError(f"{pub} or {priv} exists; use --force to replace")
+
+    with aptlib.temp_gnupg() as home:
+        aptlib.gpg(home, "--passphrase", "", "--quick-gen-key", args.uid, "ed25519", "sign", args.expire)
+        public = aptlib.gpg(home, "--armor", "--export", args.uid)
+        secret = aptlib.gpg(home, "--armor", "--export-secret-keys", args.uid)
+        fpr = aptlib.gpg(home, "--with-colons", "--fingerprint", args.uid).decode()
+
+    priv.write_bytes(secret)
+    priv.chmod(0o600)
+    pub.write_bytes(public)
+
+    fp = next(l.split(":")[9] for l in fpr.splitlines() if l.startswith("fpr:"))
+    print(f"wrote {pub} and {priv}")
+    print(f"fingerprint {fp}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except aptlib.AptError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

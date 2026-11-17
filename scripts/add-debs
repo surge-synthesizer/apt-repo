@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Add debs (paths or URLs) to a channel config, using each deb's own control fields."""
+
+import argparse
+import functools
+import json
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aptlib  # noqa: E402
+
+# newest first
+version_key = functools.cmp_to_key(lambda a, b: aptlib.compare_versions(b["version"], a["version"]))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("config", help="channel config, e.g. channels/distro.json")
+    ap.add_argument("debs", nargs="+", help="deb paths or URLs")
+    ap.add_argument("--keep", type=int, default=0,
+                    help="keep only the newest N versions of each package touched (0 keeps all)")
+    ap.add_argument("--keep-url", action="store_true",
+                    help="record URLs as given rather than copying the debs into content/")
+    ap.add_argument("--dry-run", action="store_true", help="print the changes, write nothing")
+    args = ap.parse_args()
+
+    path = Path(args.config)
+    cfg = json.loads(path.read_text())
+    aptlib.load_config(path)
+
+    touched = set()
+    for src in args.debs:
+        deb = aptlib.fetch_deb(src)
+        f = aptlib.parse_control(aptlib.read_control(deb))
+        name, version, arch = f["Package"], f["Version"], f["Architecture"]
+        if arch != "all" and arch not in cfg["architectures"]:
+            raise aptlib.AptError(f"{src}: architecture '{arch}' not in {cfg['architectures']}")
+
+        url = src
+        if aptlib.is_url(src) and not args.keep_url:
+            # nightly urls are replaced by the next build, so keep our own copy
+            local = Path("content") / aptlib.asset_name(name, version, arch)
+            dest = aptlib.ROOT / local
+            # name carries package, version and arch
+            if dest.is_file() and dest.stat().st_size == deb.stat().st_size:
+                print(f"  have {local}")
+            else:
+                if not args.dry_run:
+                    dest.parent.mkdir(exist_ok=True)
+                    shutil.copyfile(deb, dest)
+                print(f"  copy {src} -> {local}")
+            src = str(local)
+
+        pkg = next((p for p in cfg["packages"] if p["name"] == name), None)
+        if pkg is None:
+            pkg = {"name": name, "versions": []}
+            cfg["packages"].append(pkg)
+        ver = next((v for v in pkg["versions"] if v["version"] == version), None)
+        if ver is None:
+            ver = {"version": version, "debs": []}
+            pkg["versions"].append(ver)
+        if url != src and url in ver["debs"]:
+            ver["debs"].remove(url)
+        if src in ver["debs"]:
+            print(f"  have {name} {version} {arch}")
+        else:
+            ver["debs"].append(src)
+            print(f"  add  {name} {version} {arch}")
+        touched.add(name)
+
+    for pkg in cfg["packages"]:
+        if pkg["name"] not in touched:
+            continue
+        pkg["versions"].sort(key=version_key)
+        if args.keep and len(pkg["versions"]) > args.keep:
+            for v in pkg["versions"][args.keep:]:
+                print(f"  drop {pkg['name']} {v['version']}")
+            del pkg["versions"][args.keep:]
+
+    if args.dry_run:
+        print("dry run, config not written")
+        return
+    path.write_text(json.dumps(cfg, indent=2) + "\n")
+    print(f"wrote {path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except aptlib.AptError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Publish build/<channel>/ to the channel's GitHub release.
+
+Debs go up first and InRelease last, so apt never reads an index naming a deb
+that is not there yet; assets the new index no longer names are deleted after.
+Anything already uploaded with the same sha256 is left alone."""
+
+import argparse
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import aptlib  # noqa: E402
+
+# InRelease is held back and goes up on its own, last
+INDEX_ORDER = ["Packages", "Packages.gz", "Release", "Release.gpg"]
+
+
+def gh(*args, check=True):
+    r = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise aptlib.AptError(f"gh {' '.join(args)} failed:\n{r.stderr.strip()}")
+    return r
+
+
+def remote_assets(repo, tag):
+    r = gh("release", "view", tag, "--repo", repo, "--json", "assets", check=False)
+    if r.returncode != 0:
+        if "release not found" in r.stderr.lower():
+            return None
+        raise aptlib.AptError(f"gh release view {tag} failed:\n{r.stderr.strip()}")
+    return {a["name"]: a for a in json.loads(r.stdout)["assets"]}
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("config", help="channel config, e.g. channels/distro.json")
+    ap.add_argument("--dry-run", action="store_true", help="print the plan, change nothing")
+    args = ap.parse_args()
+
+    cfg = aptlib.load_config(args.config)
+    repo, tag = cfg["github_repo"], cfg["channel"]
+    d = aptlib.build_dir(cfg)
+    if not (d / "InRelease").exists():
+        raise aptlib.AptError(f"{d} not built; run create-pkg-info first")
+
+    local = {p.name: p for p in sorted(d.iterdir()) if p.is_file()}
+    debs = [n for n in local if n.endswith(".deb")]
+    index = [n for n in INDEX_ORDER + [cfg["public_key_asset"]] if n in local]
+    unknown = set(local) - set(debs) - set(index) - {"InRelease"}
+    if unknown:
+        raise aptlib.AptError(f"unexpected files in {d}: {', '.join(sorted(unknown))}")
+
+    remote = remote_assets(repo, tag)
+    create = remote is None
+    remote = remote or {}
+
+    def changed(name):
+        a = remote.get(name)
+        return a is None or a.get("digest") != sha256(local[name])
+
+    up_debs = [n for n in debs if changed(n)]
+    up_index = [n for n in index if changed(n)]
+    up_inrelease = changed("InRelease")
+    delete = sorted(set(remote) - set(local))
+
+    print(f"{repo} release '{tag}': {aptlib.repo_url(cfg)}")
+    if create:
+        print("  create the release")
+    for n in up_debs:
+        print(f"  upload {n} ({local[n].stat().st_size} bytes)")
+    for n in up_index:
+        print(f"  upload {n}")
+    if up_inrelease:
+        print("  upload InRelease")
+    for n in delete:
+        print(f"  delete {n}")
+    keep = len(local) - len(up_debs) - len(up_index) - (1 if up_inrelease else 0)
+    print(f"  {keep} unchanged")
+
+    if not (create or up_debs or up_index or up_inrelease or delete):
+        print("nothing to do")
+        return
+    if args.dry_run:
+        print("dry run, nothing changed")
+        return
+
+    if create:
+        notes = (f"apt repository, channel '{tag}'. Add it with the README in "
+                 f"https://github.com/{repo}; the files here are its index and debs.")
+        gh("release", "create", tag, "--repo", repo, "--title", f"apt: {tag}", "--notes", notes,
+           "--latest=false")
+    for batch in (up_debs, up_index, ["InRelease"] if up_inrelease else []):
+        if batch:
+            gh("release", "upload", tag, "--repo", repo, "--clobber", *[str(local[n]) for n in batch])
+            print(f"  uploaded {', '.join(batch)}", flush=True)
+    for n in delete:
+        gh("release", "delete-asset", tag, n, "--repo", repo, "--yes")
+        print(f"  deleted {n}", flush=True)
+    print(f"published {len(debs)} debs to {aptlib.repo_url(cfg)}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except aptlib.AptError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
